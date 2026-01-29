@@ -1,0 +1,678 @@
+-- MVD Blacklist Checker
+-- Автор: qqwekky 
+-- Версия: v1.12 (добавлен авто-апдейт каждые 3 дня)
+
+script_name("MVD Blacklist Checker")
+script_author("qqwekky")
+script_version("v1.12")
+
+require "lib.moonloader"
+local sampev = require "lib.samp.events"
+
+local url  = "https://raw.githubusercontent.com/qqwekky/mvd-data/main/mvd_blacklist.csv"
+local path = getWorkingDirectory() .. "\\mvd_blacklist.csv"
+local logpath = getWorkingDirectory() .. "\\mvd_error.log"
+local last_update_path = getWorkingDirectory() .. "\\mvd_last_update.txt"
+
+local UPDATE_INTERVAL_DAYS = 3
+local UPDATE_INTERVAL_SECONDS = UPDATE_INTERVAL_DAYS * 24 * 60 * 60
+
+local blacklist = {}
+local loaded = false
+local rp_enabled = true
+
+local dl_state = { attempt = 0, maxAttempts = 3, nextAttemptTime = 0, inProgress = false }
+local download_last_status = nil
+
+local DEBUG_LOG_LOOKUPS = true
+local DEBUG_LOG_PAGING = true
+local DEBUG_LOG_INDEXING = true
+local DEBUG_LOG_DUMP_MATCHES = true
+
+local last_update_timestamp = nil -- загружается/обновляется через файл
+
+local function trim(s) if not s then return "" end return s:match("^%s*(.-)%s*$") end
+
+local function writeLog(msg)
+    local f = io.open(logpath, "a")
+    if f then
+        f:write("["..os.date("%Y-%m-%d %H:%M:%S").."] "..tostring(msg).."\n")
+        f:close()
+    end
+end
+
+local function fileExists(p) local f = io.open(p, "rb") if f then f:close() return true end return false end
+
+-- Чтение/запись времени последнего обновления
+local function read_last_update()
+    if not fileExists(last_update_path) then return nil end
+    local f = io.open(last_update_path, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return nil end
+    local num = tonumber(trim(content))
+    if num then
+        return num
+    end
+    return nil
+end
+
+local function write_last_update(ts)
+    local f = io.open(last_update_path, "w")
+    if not f then
+        writeLog("Не удалось записать last_update в "..tostring(last_update_path))
+        return
+    end
+    f:write(tostring(ts))
+    f:close()
+    last_update_timestamp = ts
+    writeLog("Updated last_update timestamp: "..tostring(ts).." ("..os.date("%Y-%m-%d %H:%M:%S", ts)..")")
+end
+
+local function normalize_for_index(name)
+    if not name then return "" end
+    name = tostring(name)
+    name = name:gsub("\239\187\191", "")
+    name = name:gsub("\194\160", " ")
+    name = name:gsub("[%c%z]", "")
+    name = name:gsub('^%s*"', '')
+    name = name:gsub('"%s*$', '')
+    name = name:match("^%s*(.-)%s*$") or name
+    name = name:lower()
+    name = name:gsub("_", " ")
+    name = name:gsub("[^%w%s]+", " ")
+    name = name:gsub("%s+", " ")
+    name = name:match("^%s*(.-)%s*$") or name
+    return name
+end
+
+local function generate_variants(base)
+    local out = {}
+    if not base or base == "" then return out end
+    local n = normalize_for_index(base)
+    if n == "" then return out end
+    local cand = {
+        n,
+        n:gsub("%s","_"),
+        n:gsub("%s",""),
+        (base:lower():gsub("\239\187\191",""):gsub("\194\160"," "):gsub("[%c%z]",""):match("^%s*(.-)%s*$")) or nil,
+        (base:lower():gsub("_"," "):gsub("[%c%z]",""):match("^%s*(.-)%s*$")) or nil
+    }
+    local seen = {}
+    for _,v in ipairs(cand) do
+        if v and v ~= "" then
+            v = trim(v)
+            if not seen[v] then seen[v] = true table.insert(out, v) end
+        end
+    end
+    return out
+end
+
+local function addNick(raw, lvl)
+    if not raw then return false end
+    raw = tostring(raw)
+    raw = raw:gsub("\239\187\191",""):gsub("\194\160"," "):match("^%s*(.-)%s*$") or raw
+    if raw == "" then return false end
+    local variants = generate_variants(raw)
+    for _,v in ipairs(variants) do
+        blacklist[v] = lvl or true
+        if DEBUG_LOG_INDEXING then writeLog("Indexed variant: '"..tostring(v).."' from raw '"..tostring(raw).."'") end
+    end
+    return true
+end
+
+local function splitCSV(line)
+    local res, cur, inQuotes = {}, "", false
+    for i = 1, #line do
+        local c = line:sub(i,i)
+        if c == '"' then
+            inQuotes = not inQuotes
+        elseif c == ',' and not inQuotes then
+            table.insert(res, cur)
+            cur = ""
+        else
+            cur = cur .. c
+        end
+    end
+    table.insert(res, cur)
+    return res
+end
+
+local function looks_like_nick(col)
+    if not col then return false end
+    local s = tostring(col)
+    s = s:gsub("\239\187\191",""):gsub("\194\160"," "):gsub("[%c%z]",""):match("^%s*(.-)%s*$") or ""
+    if s == "" then return false end
+    s = s:gsub('^"', ''):gsub('"$', '')
+    if s:find("[A-Za-z]") or s:find("_") then
+        local stripped = s:gsub("%s","")
+        if stripped:match("^%d+$") then
+            return false
+        end
+        return true
+    end
+    return false
+end
+
+-- Попытка загрузить из локального файла (не стартует скачивание здесь)
+local function tryLoadFromLocal()
+    if not fileExists(path) then return false end
+    local f = io.open(path, "rb")
+    if not f then return false end
+    local content = f:read("*all")
+    f:close()
+    if not content or content == "" then return false end
+    if content:sub(1,3) == "\239\187\191" then content = content:sub(4) end
+
+    blacklist = {}
+    local count = 0
+    for line in content:gmatch("[^\r\n]+") do
+        local cols = splitCSV(line)
+        for i = 1, #cols do
+            local col = cols[i]
+            if col and trim(col) ~= "" then
+                if looks_like_nick(col) then
+                    if addNick(col, 1) then count = count + 1 end
+                else
+                    if DEBUG_LOG_INDEXING then writeLog("Skipped non-nick column: '"..tostring(col).."'") end
+                end
+            end
+        end
+    end
+    loaded = true
+    writeLog("Loaded blacklist from local file: "..tostring(count).." indexed entries (skipped non-nick columns)")
+    return true
+end
+
+local function startDownloadAttempt()
+    if dl_state.inProgress then return end
+    -- проверить, не превысили ли допустимые попытки (основной цикл также делает проверку)
+    dl_state.attempt = dl_state.attempt + 1
+    dl_state.inProgress = true
+    writeLog("Starting download attempt "..tostring(dl_state.attempt).." (url="..tostring(url)..")")
+    downloadUrlToFile(url, path, function(id, status)
+        download_last_status = status
+        dl_state.inProgress = false
+        writeLog("download callback attempt "..tostring(dl_state.attempt).." status="..tostring(status))
+    end)
+end
+
+local function parseDownloadedFile()
+    if not fileExists(path) then return false end
+    local f = io.open(path, "rb")
+    if not f then return false end
+    local content = f:read("*all")
+    f:close()
+    if not content or content == "" then return false end
+    if content:sub(1,3) == "\239\187\191" then content = content:sub(4) end
+
+    blacklist = {}
+    local count = 0
+    for line in content:gmatch("[^\r\n]+") do
+        local cols = splitCSV(line)
+        for i = 1, #cols do
+            local col = cols[i]
+            if col and trim(col) ~= "" then
+                if looks_like_nick(col) then
+                    if addNick(col, 1) then count = count + 1 end
+                else
+                    if DEBUG_LOG_INDEXING then writeLog("Skipped non-nick column (downloaded): '"..tostring(col).."'") end
+                end
+            end
+        end
+    end
+    loaded = true
+    -- обновляем временную метку последнего успешного обновления
+    write_last_update(os.time())
+    -- сброс состояния попыток (успешно обновились)
+    dl_state.attempt = 0
+    dl_state.nextAttemptTime = 0
+    writeLog("Successfully downloaded and parsed blacklist: "..tostring(count).." indexed entries (skipped non-nick columns)")
+    return true
+end
+
+local function scheduleNextAttempt()
+    local backoff = 2 ^ (dl_state.attempt - 1)
+    dl_state.nextAttemptTime = os.time() + backoff
+    writeLog("Scheduling next attempt in "..tostring(backoff).."s")
+end
+
+-- Загрузка/инициализация blacklist: загрузка локально + (при необходимости) фоновое обновление
+local function loadBlacklist()
+    blacklist = {}
+    loaded = false
+    dl_state.attempt = 0
+    dl_state.inProgress = false
+    dl_state.nextAttemptTime = 0
+    download_last_status = nil
+
+    -- загрузить последнее время обновления (если есть)
+    last_update_timestamp = read_last_update()
+    if last_update_timestamp then
+        writeLog("Last update timestamp read: "..tostring(last_update_timestamp).." ("..os.date("%Y-%m-%d %H:%M:%S", last_update_timestamp)..")")
+    else
+        writeLog("No last_update timestamp found.")
+    end
+
+    -- сначала попытаться загрузить локально (если есть) для немедленных проверок
+    local okLocal = tryLoadFromLocal()
+
+    -- Если локальный файл есть, но устарел (старше UPDATE_INTERVAL_SECONDS) или метка отсутствует -> начать фоновое обновление
+    if okLocal then
+        local now = os.time()
+        local needs_update = false
+        if not last_update_timestamp then
+            needs_update = true
+            writeLog("Local file exists but no last_update timestamp -> scheduling download.")
+        else
+            if (now - last_update_timestamp) >= UPDATE_INTERVAL_SECONDS then
+                needs_update = true
+                writeLog("Local file is older than "..tostring(UPDATE_INTERVAL_DAYS).." days -> scheduling download.")
+            else
+                writeLog("Local file is fresh (last update within "..tostring(UPDATE_INTERVAL_DAYS).." days).")
+            end
+        end
+        if needs_update and not dl_state.inProgress then
+            -- сбрасываем счётчик попыток, чтобы три попытки использовались для обновления
+            dl_state.attempt = 0
+            dl_state.nextAttemptTime = 0
+            startDownloadAttempt()
+        end
+        return
+    end
+
+    -- если локального файла нет — начинаем скачивание сразу
+    startDownloadAttempt()
+end
+
+-- ===== остальной код проверки истории/ников (без изменений) =====
+
+local history_capture = {
+    active = false,
+    expecting_dialog = false,
+    target = nil,
+    display_target = nil,
+    pages_visited = 0,
+    max_pages = 10,
+    results = {},
+    _direct_found = nil,
+    _roleplay_sent = false,
+    _check_timestamp = 0
+}
+
+local function resetHistoryCapture()
+    history_capture.active = false
+    history_capture.expecting_dialog = false
+    history_capture.target = nil
+    history_capture.display_target = nil
+    history_capture.pages_visited = 0
+    history_capture.results = {}
+    history_capture._direct_found = nil
+    history_capture._roleplay_sent = false
+    history_capture._check_timestamp = 0
+end
+
+local function checkName(raw)
+    if not raw then return nil end
+    raw = tostring(raw)
+    raw = raw:gsub("\239\187\191",""):gsub("\194\160"," "):gsub("[%c%z]",""):match("^%s*(.-)%s*$") or raw
+    if raw == "" then return nil end
+    local n = normalize_for_index(raw)
+    local variants = { n, n and n:gsub("%s","_") or nil, n and n:gsub("%s","") or nil, raw:lower() }
+    if DEBUG_LOG_LOOKUPS then
+        writeLog("Checking raw: "..tostring(raw))
+        writeLog("Normalized: "..tostring(n))
+        writeLog("Variants: space='"..tostring(n).."', underscore='"..tostring(n and n:gsub('%s','_') or "").."', nospace='"..tostring(n and n:gsub('%s','') or "").."', rawlower='"..tostring(raw:lower()).."'")
+    end
+    for _,v in ipairs(variants) do
+        if v and v ~= "" then
+            if blacklist[v] then
+                if DEBUG_LOG_LOOKUPS then writeLog("Match found for variant: "..tostring(v).." -> level="..tostring(blacklist[v])) end
+                return blacklist[v], v
+            else
+                if DEBUG_LOG_LOOKUPS then writeLog("Variant not found in blacklist: "..tostring(v)) end
+            end
+        end
+    end
+    if DEBUG_LOG_LOOKUPS then writeLog("No match for: "..tostring(raw)) end
+    return nil, nil
+end
+
+local function dumpBlacklistMatches(sub, limit)
+    if not sub or sub == "" then return end
+    local found = {}
+    local cnt = 0
+    for k,_ in pairs(blacklist) do
+        if k:find(sub, 1, true) then
+            table.insert(found, k)
+            cnt = cnt + 1
+            if cnt >= limit then break end
+        end
+    end
+    if #found > 0 then
+        writeLog("Blacklist keys containing '"..tostring(sub).."': "..table.concat(found, ", "))
+    else
+        writeLog("No blacklist keys contain substring '"..tostring(sub).."'.")
+    end
+end
+
+local function isPageButtonText_server(txt)
+    if not txt or txt == "" then return false end
+    local s = txt:lower()
+    s = s:gsub("%s+", " ")
+    if s:find("стр") then return true end
+    if s:find(">>") then return true end
+    return false
+end
+
+local function isCloseButtonText_server(txt)
+    if not txt or txt == "" then return false end
+    local s = trim(txt):lower()
+    if s == "закрыть" then return true end
+    return false
+end
+
+local function extractNameFromHistoryLine_server(line)
+    if not line then return nil end
+    local s = trim(line)
+    if s == "" then return nil end
+    local name = s:match("До%s+%d+%.%d+%.%d+%s+[%-%—–]%s*(.+)")
+    if name and name ~= "" then return trim(name) end
+    if s:find("_") then
+        for token in s:gmatch("[^%s]+") do
+            if token:find("_") then return token end
+        end
+    end
+    local maybe = s:match("^[%s]*([%a%p%s]+)$")
+    if maybe and maybe ~= "" then
+        maybe = trim(maybe)
+        if maybe:find("[A-Za-z]") and not (maybe:gsub("%s",""):match("^%d+$")) then
+            return maybe
+        end
+    end
+    return nil
+end
+
+local function formatNickForChat(param)
+    if not param then return "" end
+    return tostring(param):gsub("_", " ")
+end
+
+local function sendRoleplaySequenceAsync(displayNick, isFound)
+    if not rp_enabled then
+        if DEBUG_LOG_LOOKUPS then writeLog("RP disabled, skipping roleplay for "..tostring(displayNick)) end
+        return
+    end
+
+    local nick = formatNickForChat(displayNick or "Nick Name")
+
+    lua_thread.create(function()
+        pcall(function() sampSendChat("/todo Открепил рацию с пояса и поднёс к рту*" .. nick) end)
+        wait(1000)
+
+        if isFound then
+            pcall(function() sampSendChat("/do На другом конце рации раздался отборный мат в адрес гражданина.") end)
+            wait(1000)
+            pcall(function() sampSendChat("/todo С улыбкой на лице*Сэр, мне сказали что вы не подходите.") end)
+        else
+            pcall(function() sampSendChat("/do На другом конце рации раздался отборный мат в адрес копа.") end)
+            wait(1000)
+            pcall(function() sampSendChat("/todo С наигранной улыбкой*Вас нет в ЧС МВД.") end)
+        end
+    end)
+end
+
+local function finalizeAndPrintResults()
+    for k,v in pairs(history_capture.results) do
+        writeLog("  key='"..tostring(k).."', level="..tostring(v))
+    end
+    if history_capture._direct_found then
+        for k,v in pairs(history_capture._direct_found) do
+            writeLog("  display='"..tostring(k).."', level="..tostring(v.level)..", normalized='"..tostring(v.normalized).."'")
+        end
+    end
+
+    local merged = {}
+    for name, lvl in pairs(history_capture.results) do merged[name] = lvl end
+    if history_capture._direct_found then
+        for display, info in pairs(history_capture._direct_found) do
+            if not merged[display] then merged[display] = info.level end
+        end
+    end
+
+    local found = {}
+    for name, lvl in pairs(merged) do
+        table.insert(found, name)
+    end
+
+    local displayNick = history_capture.display_target or formatNickForChat(history_capture.target or "")
+
+    if #found == 0 then
+        sampAddChatMessage("{00FF00}[MVD] Ники игрока не обнаружены в ЧС МВД", -1)
+        if not history_capture._roleplay_sent then
+            sendRoleplaySequenceAsync(displayNick, false)
+            history_capture._roleplay_sent = true
+        end
+    else
+        sampAddChatMessage("{FF3333}[MVD] Найдено в ЧС МВД: "..table.concat(found, ", "), -1)
+        if not history_capture._roleplay_sent then
+            sendRoleplaySequenceAsync(displayNick, true)
+            history_capture._roleplay_sent = true
+        end
+    end
+
+    history_capture._direct_found = nil
+    resetHistoryCapture()
+end
+
+local function startHistoryCaptureFor(target, displayTarget)
+    history_capture.active = true
+    history_capture.expecting_dialog = false
+    history_capture.target = normalize_for_index(target)
+    history_capture.display_target = displayTarget or formatNickForChat(target)
+    history_capture.pages_visited = 0
+    history_capture.results = {}
+    history_capture._direct_found = history_capture._direct_found or {}
+    history_capture._roleplay_sent = history_capture._roleplay_sent or false
+    history_capture._check_timestamp = os.clock()
+    sampSendChat("/history "..target)
+end
+
+local function handleMvdCheckCommand(param)
+    if not param or param == "" then
+        sampAddChatMessage("{0099FF}[MVD] Использование: /mvdcheck Nick_Name", -1)
+        return
+    end
+    if not loaded then
+        sampAddChatMessage("{FF9900}[MVD] ЧС МВД не загружен. Используйте /mvdreload", -1)
+        return
+    end
+    resetHistoryCapture()
+    local target = param:match("%S+")
+    if not target then return end
+
+    writeLog("Requested check for: "..tostring(target))
+
+    local lvl, matchedVariant = checkName(target)
+    if lvl then
+        history_capture.results[target] = lvl
+        history_capture._direct_found = history_capture._direct_found or {}
+        history_capture._direct_found[target] = { level = lvl, normalized = normalize_for_index(target) }
+        if DEBUG_LOG_DUMP_MATCHES then
+            local sub = normalize_for_index(target)
+            dumpBlacklistMatches(sub, 50)
+        end
+        startHistoryCaptureFor(target, formatNickForChat(target))
+        return
+    end
+
+    startHistoryCaptureFor(target, formatNickForChat(target))
+end
+
+function sampev.onShowDialog(dialogId, dialogStyle, title, button1, button2, text)
+    if not history_capture.active then return end
+    if not title or not title:find("Прошлые имена") then return end
+    
+    if os.clock() - history_capture._check_timestamp > 30 then
+        resetHistoryCapture()
+        return
+    end
+
+    for line in text:gmatch("[^\r\n]+") do
+        local t = trim(line)
+        if t ~= "" then
+            local name = extractNameFromHistoryLine_server(t)
+            if name and name ~= "" then
+                local lvl, matchedVariant = checkName(name)
+                if lvl then
+                    history_capture.results[name] = lvl
+                end
+            end
+        end
+    end
+
+    history_capture.pages_visited = (history_capture.pages_visited or 0) + 1
+
+    local pageBtn = nil
+    local closeBtn = nil
+
+    if button1 and isPageButtonText_server(button1) then pageBtn = 1 end
+    if button2 and isPageButtonText_server(button2) then
+        if pageBtn == nil then pageBtn = 2 else
+            if button2:find(">>") or button2:find(">") or button2:lower():find("стр") then pageBtn = 2 end
+        end
+    end
+
+    if button1 and isCloseButtonText_server(button1) then closeBtn = 1 end
+    if button2 and isCloseButtonText_server(button2) then closeBtn = 2 end
+
+    if history_capture.pages_visited < history_capture.max_pages and pageBtn then
+        pcall(function() sampSendDialogResponse(dialogId, pageBtn, 0, "") end)
+        history_capture.expecting_dialog = true
+        return
+    end
+
+    if closeBtn then
+        pcall(function() sampSendDialogResponse(dialogId, closeBtn, 0, "") end)
+    else
+        pcall(function() sampSendDialogResponse(dialogId, 1, 0, "") end)
+    end
+
+    finalizeAndPrintResults()
+end
+
+function sampev.onDialogResponse(dialogId, button, listbox, input)
+end
+
+function sampev.onServerMessage(color, text)
+    if history_capture.active and text then
+        if text:find("Не удалось найти игрока") or text:find("Игрок не найден") then
+            sampAddChatMessage("{00FF00}[MVD] Игрок не найден", -1)
+            resetHistoryCapture()
+        end
+    end
+end
+
+function main()
+    repeat wait(100) until isSampAvailable()
+
+    sampAddChatMessage("{0099FF}[MVD] Разработчик: qqwekky", -1)
+    sampAddChatMessage("{0099FF}[MVD] Команды: /mvdcheck - Чекер ЧС МВД; /mvdreload - Перезагрузка ЧС", -1)
+
+    -- Загрузить возможный последний таймштамп и blacklist
+    loadBlacklist()
+    sampRegisterChatCommand("mvdcheck", function(param) handleMvdCheckCommand(param) end)
+    sampRegisterChatCommand("mvdreload", function() loadBlacklist() sampAddChatMessage("{0099FF}[MVD] Перезагрузка ЧС запущена", -1) end)
+
+    local last_periodic_check = 0
+
+    while true do
+        -- Обработка результата скачивания
+        if not loaded then
+            if download_last_status ~= nil then
+                local status = download_last_status
+                download_last_status = nil
+                if status == 58 then
+                    -- успешно скачано: распарсить и применить
+                    if parseDownloadedFile() then
+                        -- успешно распарсили и записали last_update внутри функции
+                        writeLog("Download parsed and applied.")
+                    else
+                        writeLog("Downloaded file exists but failed to parse.")
+                    end
+                else
+                    -- неуспешный статус — применяем логику попыток/бек офф
+                    if dl_state.attempt < dl_state.maxAttempts then
+                        scheduleNextAttempt()
+                    else
+                        -- все попытки исчерпаны — попытаться загрузить из локального, если есть
+                        if tryLoadFromLocal() then
+                            -- ok, используем локальный файл
+                        else
+                            sampAddChatMessage("{FF9900}[MVD] Не удалось загрузить ЧС МВД. Подробности в mvd_error.log", -1)
+                            writeLog("All download attempts failed.")
+                        end
+                    end
+                end
+            end
+
+            -- если нет прогресса и можно попробовать ещё (для первичного старта)
+            if not dl_state.inProgress and dl_state.attempt < dl_state.maxAttempts then
+                if dl_state.nextAttemptTime == 0 or os.time() >= dl_state.nextAttemptTime then
+                    startDownloadAttempt()
+                end
+            end
+        else
+            -- loaded == true: ничего делать с результатом загрузки не требуется, но обработка скачивания всё равно актуальна
+            if download_last_status ~= nil then
+                local status = download_last_status
+                download_last_status = nil
+                if status == 58 then
+                    if parseDownloadedFile() then
+                        writeLog("Periodic download parsed and applied.")
+                    else
+                        writeLog("Periodic download parsed failed.")
+                    end
+                else
+                    if dl_state.attempt < dl_state.maxAttempts then
+                        scheduleNextAttempt()
+                    else
+                        writeLog("Periodic download attempts exhausted.")
+                    end
+                end
+            end
+        end
+
+        -- Периодическая проверка: если файл устарел > UPDATE_INTERVAL_SECONDS, то инициируем обновление.
+        -- Проверяем раз в 60 секунд, чтобы не нагружать цикл.
+        if os.time() - last_periodic_check >= 60 then
+            last_periodic_check = os.time()
+            local now = os.time()
+            last_update_timestamp = last_update_timestamp or read_last_update()
+            if not last_update_timestamp then
+                -- если никогда не был апдейт — запустить обновление (если нет уже прогресс)
+                if not dl_state.inProgress then
+                    writeLog("No last_update timestamp detected during periodic check -> starting update.")
+                    dl_state.attempt = 0
+                    dl_state.nextAttemptTime = 0
+                    startDownloadAttempt()
+                end
+            else
+                if (now - last_update_timestamp) >= UPDATE_INTERVAL_SECONDS then
+                    -- файл устарел — запустить апдейт (сброс попыток, чтобы применить maxAttempts)
+                    if not dl_state.inProgress then
+                        writeLog("Periodic check: last update is older than "..tostring(UPDATE_INTERVAL_DAYS).." days -> starting update.")
+                        dl_state.attempt = 0
+                        dl_state.nextAttemptTime = 0
+                        startDownloadAttempt()
+                    else
+                        writeLog("Periodic check: file stale but download already in progress.")
+                    end
+                end
+            end
+        end
+
+        wait(1000)
+    end
+end
