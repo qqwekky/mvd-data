@@ -617,10 +617,10 @@ function main()
         ready_announced = false
         loadBlacklistAndSelfUpdate()
         if loaded then
-            sampAddChatMessage("{00FF00}[MVD] Перезагрузка завершена — локальный CSV загружен, всё в порядке. ("..os.date("%Y-%m-%d %H:%M:%S")..")", -1)
+            sampAddChatMessage("{00FF00}[MVD] Перезагрузка завершена локальный CSV загружен, всё в порядке. ("..os.date("%Y-%m-%d %H:%M:%S")..")", -1)
             announceReadyOnce()
         else
-            sampAddChatMessage("{0099FF}[MVD] Перезагрузка запущена — загрузка CSV выполняется асинхронно. Статус придёт в чат при завершении.", -1)
+            sampAddChatMessage("{0099FF}[MVD] Перезагрузка запущена загрузка CSV выполняется асинхронно. Статус придёт в чат при завершении.", -1)
         end
     end)
 
