@@ -1,20 +1,20 @@
 script_name("MVD Blacklist Checker")
-script_author("qqwekky (modified)")
-script_version("v1.15-ready-once")
+script_author("qqwekky")
+script_version("v1.15")
 
 require "lib.moonloader"
 local sampev = require "lib.samp.events"
 
--- URLs
+
 local url_csv = "https://raw.githubusercontent.com/qqwekky/mvd-data/main/mvd_blacklist.csv"
 local url_self = "https://raw.githubusercontent.com/qqwekky/mvd-data/refs/heads/main/MVD%20Blacklist%20Checker.lua"
 
--- paths
+
 local path_csv = getWorkingDirectory() .. "\\mvd_blacklist.csv"
 local logpath = getWorkingDirectory() .. "\\mvd_error.log"
 local path_self = getWorkingDirectory() .. "\\MVD Blacklist Checker.lua"
 
--- update intervals
+
 local UPDATE_INTERVAL_DAYS = 3
 local UPDATE_INTERVAL_SECONDS = UPDATE_INTERVAL_DAYS * 24 * 60 * 60
 
@@ -22,7 +22,7 @@ local blacklist = {}
 local loaded = false
 local rp_enabled = true
 
--- download state (csv and self)
+
 local dl_csv = { attempt = 0, maxAttempts = 3, nextAttemptTime = 0, inProgress = false, last_status = nil, tempPath = nil }
 local dl_self = { attempt = 0, maxAttempts = 3, nextAttemptTime = 0, inProgress = false, last_status = nil, tempPath = nil }
 
@@ -45,7 +45,7 @@ end
 
 local function fileExists(p) local f = io.open(p, "rb") if f then f:close() return true end return false end
 
--- print "Готов к работе" only once
+
 local function announceReadyOnce()
     if not ready_announced then
         sampAddChatMessage("{00FF00}[MVD] Готов к работе", -1)
@@ -53,7 +53,7 @@ local function announceReadyOnce()
     end
 end
 
--- read whole file as binary string (returns nil on error)
+
 local function readFileBinary(path)
     local f = io.open(path, "rb")
     if not f then return nil end
@@ -62,7 +62,7 @@ local function readFileBinary(path)
     return content
 end
 
--- compare two files byte-by-byte (returns true if equal)
+
 local function filesEqual(a, b)
     local ca = readFileBinary(a)
     local cb = readFileBinary(b)
@@ -71,7 +71,7 @@ local function filesEqual(a, b)
     return ca == cb
 end
 
--- safely replace dest with src (remove dest first if exists)
+
 local function replaceFile(src, dest)
     if not fileExists(src) then return false, "src_missing" end
     if fileExists(dest) then
@@ -82,7 +82,7 @@ local function replaceFile(src, dest)
     end
     local ok, err = os.rename(src, dest)
     if not ok then
-        -- fallback: copy content
+      
         local content = readFileBinary(src)
         if not content then return false, "read_src_failed" end
         local f = io.open(dest, "wb")
@@ -134,7 +134,7 @@ local function generate_variants(base)
     return out
 end
 
--- add to global blacklist (kept)
+
 local function addNick(raw, lvl)
     if not raw then return false end
     raw = tostring(raw)
@@ -148,7 +148,7 @@ local function addNick(raw, lvl)
     return true
 end
 
--- improved splitCSV to handle doubled quotes inside quoted fields
+
 local function splitCSV(line)
     local res, cur, inQuotes = {}, "", false
     local i = 1
@@ -189,7 +189,7 @@ local function looks_like_nick(col)
     return false
 end
 
--- parse CSV at path into a temporary table (doesn't mutate global blacklist)
+
 local function parseCSVToTable(p)
     if not fileExists(p) then return nil end
     local f = io.open(p, "rb")
@@ -466,7 +466,7 @@ local function startHistoryCaptureFor(target, displayTarget)
     sampSendChat("/history "..target)
 end
 
--- handle /mvdcheck
+
 local function handleMvdCheckCommand(param)
     if not param or param == "" then
         sampAddChatMessage("{0099FF}[MVD] Использование: /mvdcheck Nick_Name", -1)
@@ -498,7 +498,7 @@ local function handleMvdCheckCommand(param)
     startHistoryCaptureFor(target, formatNickForChat(target))
 end
 
--- load CSV & self-update checks
+
 local function loadBlacklistAndSelfUpdate()
     blacklist = {}
     loaded = false
@@ -522,7 +522,7 @@ local function loadBlacklistAndSelfUpdate()
         writeLog("No local CSV present or failed to parse, will download.")
     end
 
-    -- start downloads (CSV always, self only if URL present)
+    
     startDownloadGeneric(url_csv, path_csv, dl_csv, "CSV")
     if url_self and url_self ~= "" then
         startDownloadGeneric(url_self, path_self, dl_self, "SELF")
@@ -600,15 +600,20 @@ end
 function main()
     repeat wait(100) until isSampAvailable()
 
-    -- minimal startup message (ready will be announced once when appropriate)
+    
+    sampAddChatMessage("{0099FF}[MVD] Разработчик: qqwekky", -1)
+    sampAddChatMessage("{0099FF}[MVD] Поведение обновлений: файлы сравниваются с GitHub и применяются только при изменении.", -1)
+    sampAddChatMessage("{0099FF}[MVD] Команды: /mvdcheck - Чекер ЧС МВД; /mvdreload - Перезагрузка ЧС", -1)
+
+   
     announceReadyOnce()
 
     loadBlacklistAndSelfUpdate()
     sampRegisterChatCommand("mvdcheck", function(param) handleMvdCheckCommand(param) end)
 
-    -- mvdreload: запускает перезагрузку и сообщает о состоянии
+   
     sampRegisterChatCommand("mvdreload", function()
-        -- reset ready flag so reload can announce ready again once if desired
+       
         ready_announced = false
         loadBlacklistAndSelfUpdate()
         if loaded then
@@ -622,9 +627,7 @@ function main()
     local last_periodic_check = 0
 
     while true do
-        -----------------------------------------------------------
-        -- CSV download finished?
-        -----------------------------------------------------------
+
         if dl_csv.last_status ~= nil then
             local status = dl_csv.last_status
             dl_csv.last_status = nil
@@ -699,9 +702,7 @@ function main()
             end
         end
 
-        -----------------------------------------------------------
-        -- SELF (.lua) download finished?
-        -----------------------------------------------------------
+      
         if dl_self.last_status ~= nil then
             local status = dl_self.last_status
             dl_self.last_status = nil
@@ -755,12 +756,12 @@ function main()
             end
         end
 
-        -- start downloads if needed (CSV)
+        
         if not dl_csv.inProgress and (dl_csv.nextAttemptTime == 0 or os.time() >= dl_csv.nextAttemptTime) and dl_csv.attempt < dl_csv.maxAttempts then
             startDownloadGeneric(url_csv, path_csv, dl_csv, "CSV")
         end
 
-        -- start self download if configured
+        
         if url_self and url_self ~= "" then
             if not dl_self.inProgress and (dl_self.nextAttemptTime == 0 or os.time() >= dl_self.nextAttemptTime) and dl_self.attempt < dl_self.maxAttempts then
                 startDownloadGeneric(url_self, path_self, dl_self, "SELF")
