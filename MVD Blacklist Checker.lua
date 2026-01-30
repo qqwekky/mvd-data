@@ -1,44 +1,32 @@
--- MVD Blacklist Checker (self-update + always redownload CSV on join)
--- Автор: qqwekky (модификация под запрос пользователя)
--- Версия: v1.12-mod (самообновление при заходе, убран mvd_last_update.txt)
-
 script_name("MVD Blacklist Checker")
 script_author("qqwekky")
-script_version("v1.12-mod")
+script_version("v1.12-mod-fix")
 
 require "lib.moonloader"
 local sampev = require "lib.samp.events"
 
--- URLы
 local url_csv = "https://raw.githubusercontent.com/qqwekky/mvd-data/main/mvd_blacklist.csv"
 local url_self = "https://raw.githubusercontent.com/qqwekky/mvd-data/refs/heads/main/MVD%20Blacklist%20Checker.lua"
 
--- Пути (оставляем только два файла: csv и лог)
 local path_csv = getWorkingDirectory() .. "\\mvd_blacklist.csv"
 local logpath = getWorkingDirectory() .. "\\mvd_error.log"
--- путь до самого lua-файла в рабочей директории (имя файла должно совпадать с тем, что используется локально)
 local path_self = getWorkingDirectory() .. "\\MVD Blacklist Checker.lua"
 
--- Интервалы и константы (оставляем обновление при старте, периодика опциональна)
 local UPDATE_INTERVAL_DAYS = 3
 local UPDATE_INTERVAL_SECONDS = UPDATE_INTERVAL_DAYS * 24 * 60 * 60
 
--- Состояние данных
 local blacklist = {}
 local loaded = false
 local rp_enabled = true
 
--- Отдельные состояния скачивания: для CSV и для self-update
 local dl_csv = { attempt = 0, maxAttempts = 3, nextAttemptTime = 0, inProgress = false, last_status = nil }
 local dl_self = { attempt = 0, maxAttempts = 3, nextAttemptTime = 0, inProgress = false, last_status = nil }
 
--- Отладочные флаги (сохраняем как в оригинале)
 local DEBUG_LOG_LOOKUPS = true
 local DEBUG_LOG_PAGING = true
 local DEBUG_LOG_INDEXING = true
 local DEBUG_LOG_DUMP_MATCHES = true
 
--- Вспомогательные функции
 local function trim(s) if not s then return "" end return s:match("^%s*(.-)%s*$") end
 
 local function writeLog(msg)
@@ -51,7 +39,6 @@ end
 
 local function fileExists(p) local f = io.open(p, "rb") if f then f:close() return true end return false end
 
--- Нормализация и генерация вариантов
 local function normalize_for_index(name)
     if not name then return "" end
     name = tostring(name)
@@ -137,7 +124,6 @@ local function looks_like_nick(col)
     return false
 end
 
--- Парсинг CSV по пути, общий для локального и загруженного файла
 local function parseCSVAtPath(p)
     if not fileExists(p) then return false end
     local f = io.open(p, "rb")
@@ -167,7 +153,6 @@ local function parseCSVAtPath(p)
     return true
 end
 
--- Попытка загрузить из локального CSV для мгновенной доступности
 local function tryLoadFromLocalCSV()
     if not fileExists(path_csv) then return false end
     local ok = parseCSVAtPath(path_csv)
@@ -177,9 +162,11 @@ local function tryLoadFromLocalCSV()
     return ok
 end
 
--- Универсальный стартер загрузки с callback'ом состояния
 local function startDownloadGeneric(downloadUrl, destPath, stateTable, label)
     if stateTable.inProgress then return end
+    if stateTable.attempt >= stateTable.maxAttempts and stateTable.nextAttemptTime ~= 0 and os.time() < stateTable.nextAttemptTime then
+        return
+    end
     stateTable.attempt = stateTable.attempt + 1
     stateTable.inProgress = true
     writeLog("Starting download attempt "..tostring(stateTable.attempt).." for "..tostring(label).." url="..tostring(downloadUrl))
@@ -191,12 +178,11 @@ local function startDownloadGeneric(downloadUrl, destPath, stateTable, label)
 end
 
 local function scheduleNextAttemptFor(stateTable, label)
-    local backoff = 2 ^ (stateTable.attempt - 1)
+    local backoff = 2 ^ (math.max(0, stateTable.attempt - 1))
     stateTable.nextAttemptTime = os.time() + backoff
     writeLog("Scheduling next attempt for "..tostring(label).." in "..tostring(backoff).."s")
 end
 
--- История/проверки (как в оригинале)
 local history_capture = {
     active = false,
     expecting_dialog = false,
@@ -483,7 +469,6 @@ function sampev.onServerMessage(color, text)
     end
 end
 
--- Инициализация загрузки blacklist и self-update, убрана логика с last_update.txt, всегда обновляем при старте
 local function loadBlacklistAndSelfUpdate()
     blacklist = {}
     loaded = false
@@ -498,7 +483,6 @@ local function loadBlacklistAndSelfUpdate()
     dl_self.nextAttemptTime = 0
     dl_self.last_status = nil
 
-    -- Попытаться быстро загрузить локально CSV для мгновенных проверок
     local okLocal = tryLoadFromLocalCSV()
     if okLocal then
         writeLog("Local CSV loaded for immediate use.")
@@ -506,13 +490,7 @@ local function loadBlacklistAndSelfUpdate()
         writeLog("No local CSV present or failed to parse, will download.")
     end
 
-    -- Незамедлительно инициируем скачивание CSV и self lua-файла (каждый раз при заходе)
-    dl_csv.attempt = 0
-    dl_csv.nextAttemptTime = 0
     startDownloadGeneric(url_csv, path_csv, dl_csv, "CSV")
-
-    dl_self.attempt = 0
-    dl_self.nextAttemptTime = 0
     startDownloadGeneric(url_self, path_self, dl_self, "SELF")
 end
 
@@ -522,7 +500,6 @@ function main()
     sampAddChatMessage("{0099FF}[MVD] Разработчик: qqwekky (self-update enabled)", -1)
     sampAddChatMessage("{0099FF}[MVD] Команды: /mvdcheck - Чекер ЧС МВД; /mvdreload - Перезагрузка ЧС", -1)
 
-    -- Запускаем загрузку локального CSV и попытки скачать CSV и сам скрипт
     loadBlacklistAndSelfUpdate()
     sampRegisterChatCommand("mvdcheck", function(param) handleMvdCheckCommand(param) end)
     sampRegisterChatCommand("mvdreload", function() loadBlacklistAndSelfUpdate() sampAddChatMessage("{0099FF}[MVD] Перезагрузка ЧС запущена", -1) end)
@@ -530,73 +507,64 @@ function main()
     local last_periodic_check = 0
 
     while true do
-        -- Обработка результатов скачивания CSV
         if dl_csv.last_status ~= nil then
             local status = dl_csv.last_status
             dl_csv.last_status = nil
             if status == 58 then
-                -- успешно скачано: распарсить и применить
                 if parseCSVAtPath(path_csv) then
                     writeLog("CSV download parsed and applied.")
                     sampAddChatMessage("{0099FF}[MVD] CSV успешно обновлён.", -1)
                 else
                     writeLog("Downloaded CSV exists but failed to parse.")
                 end
-                -- сброс попыток для будущих обновлений
                 dl_csv.attempt = 0
-                dl_csv.nextAttemptTime = 0
+                dl_csv.nextAttemptTime = os.time() + UPDATE_INTERVAL_SECONDS
+                writeLog("Next CSV full update scheduled at "..tostring(os.date("%Y-%m-%d %H:%M:%S", dl_csv.nextAttemptTime)))
             else
                 if dl_csv.attempt < dl_csv.maxAttempts then
                     scheduleNextAttemptFor(dl_csv, "CSV")
                 else
                     writeLog("CSV download attempts exhausted.")
-                    -- если есть локальный файл - продолжим использовать его, иначе предупредим
                     if not tryLoadFromLocalCSV() then
                         sampAddChatMessage("{FF9900}[MVD] Не удалось загрузить ЧС МВД. Подробности в mvd_error.log", -1)
                         writeLog("All CSV download attempts failed and no local CSV found.")
                     end
+                    dl_csv.nextAttemptTime = os.time() + UPDATE_INTERVAL_SECONDS
+                    writeLog("Next CSV full update scheduled at "..tostring(os.date("%Y-%m-%d %H:%M:%S", dl_csv.nextAttemptTime)))
                 end
             end
         end
 
-        -- Обработка результатов скачивания SELF (lua-файла)
         if dl_self.last_status ~= nil then
             local status = dl_self.last_status
             dl_self.last_status = nil
             if status == 58 then
                 writeLog("Self-update file downloaded to: "..tostring(path_self))
                 sampAddChatMessage("{0099FF}[MVD] Скрипт обновлён на диск. Перезапустите скрипт или клиент, чтобы применить изменения.", -1)
-                -- сброс попыток для будущих обновлений
                 dl_self.attempt = 0
-                dl_self.nextAttemptTime = 0
+                dl_self.nextAttemptTime = os.time() + UPDATE_INTERVAL_SECONDS
+                writeLog("Next SELF full update scheduled at "..tostring(os.date("%Y-%m-%d %H:%M:%S", dl_self.nextAttemptTime)))
             else
                 if dl_self.attempt < dl_self.maxAttempts then
                     scheduleNextAttemptFor(dl_self, "SELF")
                 else
                     writeLog("Self-update download attempts exhausted.")
+                    dl_self.nextAttemptTime = os.time() + UPDATE_INTERVAL_SECONDS
+                    writeLog("Next SELF full update scheduled at "..tostring(os.date("%Y-%m-%d %H:%M:%S", dl_self.nextAttemptTime)))
                 end
             end
         end
 
-        -- Попытки повторного запуска скачиваний при неуспехе и по расписанию
-        -- CSV
-        if not dl_csv.inProgress and dl_csv.attempt < dl_csv.maxAttempts then
-            if dl_csv.nextAttemptTime == 0 or os.time() >= dl_csv.nextAttemptTime then
-                startDownloadGeneric(url_csv, path_csv, dl_csv, "CSV")
-            end
-        end
-        -- SELF
-        if not dl_self.inProgress and dl_self.attempt < dl_self.maxAttempts then
-            if dl_self.nextAttemptTime == 0 or os.time() >= dl_self.nextAttemptTime then
-                startDownloadGeneric(url_self, path_self, dl_self, "SELF")
-            end
+        if not dl_csv.inProgress and (dl_csv.nextAttemptTime == 0 or os.time() >= dl_csv.nextAttemptTime) and dl_csv.attempt < dl_csv.maxAttempts then
+            startDownloadGeneric(url_csv, path_csv, dl_csv, "CSV")
         end
 
-        -- Периодическая проверка на устаревание CSV (опционально, чтобы перекачивать позднее)
+        if not dl_self.inProgress and (dl_self.nextAttemptTime == 0 or os.time() >= dl_self.nextAttemptTime) and dl_self.attempt < dl_self.maxAttempts then
+            startDownloadGeneric(url_self, path_self, dl_self, "SELF")
+        end
+
         if os.time() - last_periodic_check >= 60 then
             last_periodic_check = os.time()
-            -- если CSV давно не обновлялся локально, инициируем повторную загрузку
-            -- здесь простая эвристика: если локального файла нет, пробуем скачать, иначе оставляем периодические попытки на скачивание (по флагам dl_csv)
             if not fileExists(path_csv) and not dl_csv.inProgress then
                 writeLog("Periodic check: no local CSV present -> starting CSV download.")
                 dl_csv.attempt = 0
